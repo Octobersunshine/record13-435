@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -11,12 +12,51 @@ import (
 	"time"
 )
 
+type TCPConnectionRaw struct {
+	LocalAddress  string `json:"LocalAddress"`
+	LocalPort     int    `json:"LocalPort"`
+	RemoteAddress string `json:"RemoteAddress"`
+	RemotePort    int    `json:"RemotePort"`
+	State         int    `json:"State"`
+	OwningProcess int    `json:"OwningProcess"`
+}
+
 type TCPConnection struct {
 	LocalAddress  string `json:"local_address"`
 	LocalPort     int    `json:"local_port"`
 	RemoteAddress string `json:"remote_address"`
 	RemotePort    int    `json:"remote_port"`
-	State         int    `json:"state"`
+	State         string `json:"state"`
+	StateCode     int    `json:"state_code"`
+	PID           int    `json:"pid"`
+	ProcessName   string `json:"process_name,omitempty"`
+	IsBusiness    bool   `json:"is_business"`
+}
+
+type ProcessInfo struct {
+	PID         int    `json:"Id"`
+	ProcessName string `json:"ProcessName"`
+}
+
+type ConnectionResponse struct {
+	BusinessCount    int                   `json:"business_count"`
+	SystemCount      int                   `json:"system_count"`
+	Total            int                   `json:"total"`
+	Timestamp        string                `json:"timestamp"`
+	BusinessStates   map[string]int        `json:"business_states,omitempty"`
+	SystemStates     map[string]int        `json:"system_states,omitempty"`
+	TopProcesses     map[string]int        `json:"top_processes,omitempty"`
+	Connections      []TCPConnection       `json:"connections,omitempty"`
+	Error            string                `json:"error,omitempty"`
+}
+
+type FilterOptions struct {
+	State        string
+	OnlyBusiness bool
+	LocalPort    int
+	RemotePort   int
+	ProcessName  string
+	ShowDetails  bool
 }
 
 var tcpStateNames = map[int]string{
@@ -35,6 +75,26 @@ var tcpStateNames = map[int]string{
 	100: "BOUND",
 }
 
+var systemProcessNames = map[string]bool{
+	"system":            true,
+	"registry":          true,
+	"smss.exe":          true,
+	"csrss.exe":         true,
+	"wininit.exe":       true,
+	"winlogon.exe":      true,
+	"services.exe":      true,
+	"lsass.exe":         true,
+	"svchost.exe":       true,
+	"fontdrvhost.exe":   true,
+	"dwm.exe":           true,
+	"dllhost.exe":       true,
+	"taskhostw.exe":     true,
+	"runtimebroker.exe": true,
+	"searchindexer.exe": true,
+	"spoolsv.exe":       true,
+	"explorer.exe":      true,
+}
+
 func GetTCPStateName(state int) string {
 	if name, ok := tcpStateNames[state]; ok {
 		return name
@@ -42,17 +102,96 @@ func GetTCPStateName(state int) string {
 	return strconv.Itoa(state)
 }
 
-type ConnectionResponse struct {
-	Total      int             `json:"total"`
-	Count      int             `json:"count"`
-	Timestamp  string          `json:"timestamp"`
-	States     map[string]int  `json:"states,omitempty"`
-	Error      string          `json:"error,omitempty"`
+func isLoopback(addr string) bool {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback()
+}
+
+func isSystemProcess(name string) bool {
+	return systemProcessNames[strings.ToLower(name)]
+}
+
+func isBusinessConnection(conn TCPConnection) bool {
+	stateName := conn.State
+	if stateName != "ESTABLISHED" && stateName != "CLOSE_WAIT" {
+		return false
+	}
+	if isLoopback(conn.LocalAddress) && isLoopback(conn.RemoteAddress) {
+		return false
+	}
+	if conn.ProcessName != "" && isSystemProcess(conn.ProcessName) {
+		return false
+	}
+	if conn.RemotePort == 0 {
+		return false
+	}
+	return true
+}
+
+func GetProcessMap() (map[int]string, error) {
+	cmd := exec.Command("powershell", "-NoProfile", "-Command",
+		`Get-Process | Select-Object -Property Id, ProcessName | ConvertTo-Json`)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
+	outputStr := strings.TrimSpace(string(output))
+	if outputStr == "" {
+		return make(map[int]string), nil
+	}
+
+	var procs []ProcessInfo
+	err = json.Unmarshal([]byte(outputStr), &procs)
+	if err != nil {
+		var singleProc ProcessInfo
+		if err2 := json.Unmarshal([]byte(outputStr), &singleProc); err2 == nil {
+			procs = []ProcessInfo{singleProc}
+		} else {
+			return nil, err
+		}
+	}
+
+	procMap := make(map[int]string)
+	for _, p := range procs {
+		procMap[p.PID] = p.ProcessName
+	}
+
+	return procMap, nil
+}
+
+type TCPConnectionEnriched struct {
+	LocalAddress  string `json:"LocalAddress"`
+	LocalPort     int    `json:"LocalPort"`
+	RemoteAddress string `json:"RemoteAddress"`
+	RemotePort    int    `json:"RemotePort"`
+	State         int    `json:"State"`
+	OwningProcess int    `json:"OwningProcess"`
+	ProcessName   string `json:"ProcessName"`
 }
 
 func GetTCPConnections() ([]TCPConnection, error) {
-	cmd := exec.Command("powershell", "-NoProfile", "-Command",
-		`Get-NetTCPConnection | Select-Object -Property LocalAddress,LocalPort,RemoteAddress,RemotePort,State | ConvertTo-Json`)
+	psScript := `
+$procMap = @{}
+Get-Process | ForEach-Object { $procMap[[uint32]$_.Id] = $_.ProcessName }
+Get-NetTCPConnection | ForEach-Object {
+    $owningPid = $_.OwningProcess
+    [PSCustomObject]@{
+        LocalAddress  = $_.LocalAddress
+        LocalPort     = $_.LocalPort
+        RemoteAddress = $_.RemoteAddress
+        RemotePort    = $_.RemotePort
+        State         = [int]$_.State
+        OwningProcess = $owningPid
+        ProcessName   = $procMap[$owningPid]
+    }
+} | ConvertTo-Json`
+
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", psScript)
 
 	output, err := cmd.Output()
 	if err != nil {
@@ -64,50 +203,139 @@ func GetTCPConnections() ([]TCPConnection, error) {
 		return []TCPConnection{}, nil
 	}
 
-	var connections []TCPConnection
-	err = json.Unmarshal([]byte(outputStr), &connections)
+	var rawConns []TCPConnectionEnriched
+	err = json.Unmarshal([]byte(outputStr), &rawConns)
 	if err != nil {
-		var singleConn TCPConnection
+		var singleConn TCPConnectionEnriched
 		if err2 := json.Unmarshal([]byte(outputStr), &singleConn); err2 == nil {
-			return []TCPConnection{singleConn}, nil
+			rawConns = []TCPConnectionEnriched{singleConn}
+		} else {
+			return nil, err
 		}
-		return nil, err
+	}
+
+	connections := make([]TCPConnection, 0, len(rawConns))
+	for _, raw := range rawConns {
+		stateName := GetTCPStateName(raw.State)
+		conn := TCPConnection{
+			LocalAddress:  raw.LocalAddress,
+			LocalPort:     raw.LocalPort,
+			RemoteAddress: raw.RemoteAddress,
+			RemotePort:    raw.RemotePort,
+			State:         stateName,
+			StateCode:     raw.State,
+			PID:           raw.OwningProcess,
+			ProcessName:   raw.ProcessName,
+		}
+		conn.IsBusiness = isBusinessConnection(conn)
+		connections = append(connections, conn)
 	}
 
 	return connections, nil
 }
 
-func CountTCPConnections() (int, map[string]int, error) {
-	connections, err := GetTCPConnections()
-	if err != nil {
-		return 0, nil, err
-	}
+func ParseFilterOptions(r *http.Request) FilterOptions {
+	opts := FilterOptions{}
 
-	stateCount := make(map[string]int)
+	opts.State = strings.ToUpper(r.URL.Query().Get("state"))
+	opts.OnlyBusiness = r.URL.Query().Get("only_business") == "true" || r.URL.Query().Get("business") == "true"
+	opts.ShowDetails = r.URL.Query().Get("details") == "true"
+
+	if lp := r.URL.Query().Get("local_port"); lp != "" {
+		if port, err := strconv.Atoi(lp); err == nil {
+			opts.LocalPort = port
+		}
+	}
+	if rp := r.URL.Query().Get("remote_port"); rp != "" {
+		if port, err := strconv.Atoi(rp); err == nil {
+			opts.RemotePort = port
+		}
+	}
+	opts.ProcessName = strings.ToLower(r.URL.Query().Get("process"))
+
+	return opts
+}
+
+func FilterConnections(connections []TCPConnection, opts FilterOptions) []TCPConnection {
+	result := make([]TCPConnection, 0)
 	for _, conn := range connections {
-		stateName := GetTCPStateName(conn.State)
-		stateCount[stateName]++
+		if opts.State != "" && conn.State != opts.State {
+			continue
+		}
+		if opts.OnlyBusiness && !conn.IsBusiness {
+			continue
+		}
+		if opts.LocalPort != 0 && conn.LocalPort != opts.LocalPort {
+			continue
+		}
+		if opts.RemotePort != 0 && conn.RemotePort != opts.RemotePort {
+			continue
+		}
+		if opts.ProcessName != "" && !strings.Contains(strings.ToLower(conn.ProcessName), opts.ProcessName) {
+			continue
+		}
+		result = append(result, conn)
+	}
+	return result
+}
+
+func CountConnections(connections []TCPConnection) (int, int, map[string]int, map[string]int, map[string]int) {
+	businessCount := 0
+	systemCount := 0
+	businessStates := make(map[string]int)
+	systemStates := make(map[string]int)
+	procCount := make(map[string]int)
+
+	for _, conn := range connections {
+		if conn.IsBusiness {
+			businessCount++
+			businessStates[conn.State]++
+		} else {
+			systemCount++
+			systemStates[conn.State]++
+		}
+		if conn.ProcessName != "" {
+			procCount[conn.ProcessName]++
+		} else {
+			procCount["PID:"+strconv.Itoa(conn.PID)]++
+		}
 	}
 
-	return len(connections), stateCount, nil
+	return businessCount, systemCount, businessStates, systemStates, procCount
 }
 
 func connectionHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	count, states, err := CountTCPConnections()
-
-	response := ConnectionResponse{
-		Total:     count,
-		Count:     count,
-		Timestamp: time.Now().Format(time.RFC3339),
-		States:    states,
+	allConnections, err := GetTCPConnections()
+	if err != nil {
+		response := ConnectionResponse{
+			Error:     err.Error(),
+			Timestamp: time.Now().Format(time.RFC3339),
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(response)
+		return
 	}
 
-	if err != nil {
-		response.Error = err.Error()
-		w.WriteHeader(http.StatusInternalServerError)
+	opts := ParseFilterOptions(r)
+	filteredConnections := FilterConnections(allConnections, opts)
+
+	businessCount, systemCount, businessStates, systemStates, procCount := CountConnections(filteredConnections)
+
+	response := ConnectionResponse{
+		BusinessCount:  businessCount,
+		SystemCount:    systemCount,
+		Total:          businessCount + systemCount,
+		Timestamp:      time.Now().Format(time.RFC3339),
+		BusinessStates: businessStates,
+		SystemStates:   systemStates,
+		TopProcesses:   procCount,
+	}
+
+	if opts.ShowDetails {
+		response.Connections = filteredConnections
 	}
 
 	json.NewEncoder(w).Encode(response)
@@ -135,6 +363,13 @@ func main() {
 	log.Printf("TCP Connection API server starting on port %s", port)
 	log.Printf("Endpoints:")
 	log.Printf("  GET /api/tcp-connections - Get TCP connection count")
+	log.Printf("      Query params:")
+	log.Printf("        only_business=true  - Only show business connections")
+	log.Printf("        state=ESTABLISHED   - Filter by state (ESTABLISHED, LISTENING, etc.)")
+	log.Printf("        local_port=8080     - Filter by local port")
+	log.Printf("        remote_port=443     - Filter by remote port")
+	log.Printf("        process=chrome      - Filter by process name")
+	log.Printf("        details=true        - Include full connection details in response")
 	log.Printf("  GET /health              - Health check")
 
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
