@@ -38,16 +38,28 @@ type ProcessInfo struct {
 	ProcessName string `json:"ProcessName"`
 }
 
+type PortStat struct {
+	Count        int            `json:"count"`
+	Business     int            `json:"business"`
+	System       int            `json:"system"`
+	Processes    map[string]int `json:"processes,omitempty"`
+	States       map[string]int `json:"states,omitempty"`
+}
+
 type ConnectionResponse struct {
-	BusinessCount    int                   `json:"business_count"`
-	SystemCount      int                   `json:"system_count"`
-	Total            int                   `json:"total"`
-	Timestamp        string                `json:"timestamp"`
-	BusinessStates   map[string]int        `json:"business_states,omitempty"`
-	SystemStates     map[string]int        `json:"system_states,omitempty"`
-	TopProcesses     map[string]int        `json:"top_processes,omitempty"`
-	Connections      []TCPConnection       `json:"connections,omitempty"`
-	Error            string                `json:"error,omitempty"`
+	BusinessCount      int                   `json:"business_count"`
+	SystemCount        int                   `json:"system_count"`
+	Total              int                   `json:"total"`
+	Timestamp          string                `json:"timestamp"`
+	BusinessStates     map[string]int        `json:"business_states,omitempty"`
+	SystemStates       map[string]int        `json:"system_states,omitempty"`
+	TopProcesses       map[string]int        `json:"top_processes,omitempty"`
+	BusinessLocalPorts map[string]*PortStat  `json:"business_local_ports,omitempty"`
+	BusinessRemotePorts map[string]*PortStat `json:"business_remote_ports,omitempty"`
+	SystemLocalPorts   map[string]*PortStat  `json:"system_local_ports,omitempty"`
+	SystemRemotePorts  map[string]*PortStat  `json:"system_remote_ports,omitempty"`
+	Connections        []TCPConnection       `json:"connections,omitempty"`
+	Error              string                `json:"error,omitempty"`
 }
 
 type FilterOptions struct {
@@ -279,29 +291,72 @@ func FilterConnections(connections []TCPConnection, opts FilterOptions) []TCPCon
 	return result
 }
 
-func CountConnections(connections []TCPConnection) (int, int, map[string]int, map[string]int, map[string]int) {
+func getOrCreatePortStat(m map[string]*PortStat, key string) *PortStat {
+	if _, ok := m[key]; !ok {
+		m[key] = &PortStat{
+			Processes: make(map[string]int),
+			States:    make(map[string]int),
+		}
+	}
+	return m[key]
+}
+
+func CountConnections(connections []TCPConnection) (int, int, map[string]int, map[string]int, map[string]int, map[string]*PortStat, map[string]*PortStat, map[string]*PortStat, map[string]*PortStat) {
 	businessCount := 0
 	systemCount := 0
 	businessStates := make(map[string]int)
 	systemStates := make(map[string]int)
 	procCount := make(map[string]int)
 
+	bizLocalPorts := make(map[string]*PortStat)
+	bizRemotePorts := make(map[string]*PortStat)
+	sysLocalPorts := make(map[string]*PortStat)
+	sysRemotePorts := make(map[string]*PortStat)
+
 	for _, conn := range connections {
+		procName := conn.ProcessName
+		if procName == "" {
+			procName = "PID:" + strconv.Itoa(conn.PID)
+		}
+		procCount[procName]++
+
+		localPortKey := strconv.Itoa(conn.LocalPort)
+		remotePortKey := strconv.Itoa(conn.RemotePort)
+
 		if conn.IsBusiness {
 			businessCount++
 			businessStates[conn.State]++
+
+			blp := getOrCreatePortStat(bizLocalPorts, localPortKey)
+			blp.Count++
+			blp.Business++
+			blp.Processes[procName]++
+			blp.States[conn.State]++
+
+			brp := getOrCreatePortStat(bizRemotePorts, remotePortKey)
+			brp.Count++
+			brp.Business++
+			brp.Processes[procName]++
+			brp.States[conn.State]++
 		} else {
 			systemCount++
 			systemStates[conn.State]++
-		}
-		if conn.ProcessName != "" {
-			procCount[conn.ProcessName]++
-		} else {
-			procCount["PID:"+strconv.Itoa(conn.PID)]++
+
+			slp := getOrCreatePortStat(sysLocalPorts, localPortKey)
+			slp.Count++
+			slp.System++
+			slp.Processes[procName]++
+			slp.States[conn.State]++
+
+			srp := getOrCreatePortStat(sysRemotePorts, remotePortKey)
+			srp.Count++
+			srp.System++
+			srp.Processes[procName]++
+			srp.States[conn.State]++
 		}
 	}
 
-	return businessCount, systemCount, businessStates, systemStates, procCount
+	return businessCount, systemCount, businessStates, systemStates, procCount, bizLocalPorts, bizRemotePorts, sysLocalPorts, sysRemotePorts
 }
 
 func connectionHandler(w http.ResponseWriter, r *http.Request) {
@@ -322,16 +377,20 @@ func connectionHandler(w http.ResponseWriter, r *http.Request) {
 	opts := ParseFilterOptions(r)
 	filteredConnections := FilterConnections(allConnections, opts)
 
-	businessCount, systemCount, businessStates, systemStates, procCount := CountConnections(filteredConnections)
+	businessCount, systemCount, businessStates, systemStates, procCount, bizLocalPorts, bizRemotePorts, sysLocalPorts, sysRemotePorts := CountConnections(filteredConnections)
 
 	response := ConnectionResponse{
-		BusinessCount:  businessCount,
-		SystemCount:    systemCount,
-		Total:          businessCount + systemCount,
-		Timestamp:      time.Now().Format(time.RFC3339),
-		BusinessStates: businessStates,
-		SystemStates:   systemStates,
-		TopProcesses:   procCount,
+		BusinessCount:       businessCount,
+		SystemCount:         systemCount,
+		Total:               businessCount + systemCount,
+		Timestamp:           time.Now().Format(time.RFC3339),
+		BusinessStates:      businessStates,
+		SystemStates:        systemStates,
+		TopProcesses:        procCount,
+		BusinessLocalPorts:  bizLocalPorts,
+		BusinessRemotePorts: bizRemotePorts,
+		SystemLocalPorts:    sysLocalPorts,
+		SystemRemotePorts:   sysRemotePorts,
 	}
 
 	if opts.ShowDetails {
